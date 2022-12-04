@@ -10,7 +10,8 @@ import torch
 import numpy as np
 
 import pynvml
-import PPO_model
+import ERL_model
+from mlp import MLPIndiv
 from env.load_data import nums_detec
 
 import warnings
@@ -67,8 +68,14 @@ def main():
     test_files = test_files[:num_ins]
     mod_files = os.listdir('./model/')[:]
 
-    memories = PPO_model.Memory()
-    model = PPO_model.PPO(model_paras, train_paras)
+    pop_size = model_paras["pop_size"]
+    n_hidden_actor = model_paras["n_hidden_actor"]
+    actor_dim = model_paras["actor_in_dim"]
+    n_latent_actor = model_paras["n_latent_actor"]
+    action_dim = model_paras["action_dim"]
+
+    memories = ERL_model.Memory()
+    model = ERL_model.ERL(model_paras, train_paras, MLPIndiv(n_hidden_actor, actor_dim, n_latent_actor, action_dim).to(device))
     rules = test_paras["rules"]
     envs = []  # Store multiple environments
 

@@ -1,3 +1,6 @@
+import sys
+import torch
+import numpy
 import copy
 import math
 import torch
@@ -5,8 +8,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical
 from graph.hgnn import GATedge, MLPsim
-from mlp import MLPCritic, MLPActor
-
+from PPO_model import MLPs
+from mlp import MLPIndiv
+import utils.erl_utils as utils
+from mlp import MLPIndiv
+from neuroevolution import SSNE
+from torch.multiprocessing import Process, Pipe, Manager
 
 class Memory:
     def __init__(self):
@@ -45,67 +52,11 @@ class Memory:
         del self.jobs_gather[:]
         del self.eligible[:]
         del self.nums_opes[:]
-        
 
-class MLPs(nn.Module):
-    '''
-    MLPs in operation node embedding
-    '''
-    def __init__(self, W_sizes_ope, hidden_size_ope, out_size_ope, num_head, dropout):
-        '''
-        The multi-head and dropout mechanisms are not actually used in the final experiment.
-        :param W_sizes_ope: A list of the dimension of input vector for each type,
-        including [machine, operation (pre), operation (sub), operation (self)]
-        :param hidden_size_ope: hidden dimensions of the MLPs
-        :param out_size_ope: dimension of the embedding of operation nodes
-        '''
-        super(MLPs, self).__init__()
-        self.in_sizes_ope = W_sizes_ope
-        self.hidden_size_ope = hidden_size_ope
-        self.out_size_ope = out_size_ope
-        self.num_head = num_head
-        self.dropout = dropout
-        self.gnn_layers = nn.ModuleList()
 
-        # A total of five MLPs and MLP_0 (self.project) aggregates information from other MLPs
-        for i in range(len(self.in_sizes_ope)):
-            self.gnn_layers.append(MLPsim(self.in_sizes_ope[i], self.out_size_ope, self.hidden_size_ope, self.num_head,
-                                          self.dropout, self.dropout))
-        self.project = nn.Sequential(
-            nn.ELU(),
-            nn.Linear(self.out_size_ope * len(self.in_sizes_ope), self.hidden_size_ope),
-            nn.ELU(),
-            nn.Linear(self.hidden_size_ope, self.hidden_size_ope),
-            nn.ELU(),
-            nn.Linear(self.hidden_size_ope, self.out_size_ope),
-        )
-
-    def forward(self, ope_ma_adj_batch, ope_pre_adj_batch, ope_sub_adj_batch, batch_idxes, feats):
-        '''
-        :param ope_ma_adj_batch: Adjacency matrix of operation and machine nodes
-        :param ope_pre_adj_batch: Adjacency matrix of operation and pre-operation nodes
-        :param ope_sub_adj_batch: Adjacency matrix of operation and sub-operation nodes
-        :param batch_idxes: Uncompleted instances
-        :param feats: Contains operation, machine and edge features
-        '''
-        h = (feats[1], feats[0], feats[0], feats[0])
-        # Identity matrix for self-loop of nodes
-        self_adj = torch.eye(feats[0].size(-2),
-                             dtype=torch.int64).unsqueeze(0).expand_as(ope_pre_adj_batch[batch_idxes])
-
-        # Calculate an return operation embedding
-        adj = (ope_ma_adj_batch[batch_idxes], ope_pre_adj_batch[batch_idxes],
-               ope_sub_adj_batch[batch_idxes], self_adj)
-        MLP_embeddings = []
-        for i in range(len(adj)):
-            MLP_embeddings.append(self.gnn_layers[i](h[i], adj[i]))
-        MLP_embedding_in = torch.cat(MLP_embeddings, dim=-1)
-        mu_ij_prime = self.project(MLP_embedding_in)
-        return mu_ij_prime
-
-class HGNNScheduler(nn.Module):
-    def __init__(self, model_paras):
-        super(HGNNScheduler, self).__init__()
+class ERLScheduler(nn.Module):
+    def __init__(self, model_paras, actor):
+        super(ERLScheduler, self).__init__()
         self.device = model_paras["device"]
         self.in_size_ma = model_paras["in_size_ma"]  # Dimension of the raw feature vectors of machine nodes
         self.out_size_ma = model_paras["out_size_ma"]  # Dimension of the embedding of machine nodes
@@ -113,12 +64,10 @@ class HGNNScheduler(nn.Module):
         self.out_size_ope = model_paras["out_size_ope"]  # Dimension of the embedding of operation nodes
         self.hidden_size_ope = model_paras["hidden_size_ope"]  # Hidden dimensions of the MLPs
         self.actor_dim = model_paras["actor_in_dim"]  # Input dimension of actor
-        self.critic_dim = model_paras["critic_in_dim"]  # Input dimension of critic
         self.n_latent_actor = model_paras["n_latent_actor"]  # Hidden dimensions of the actor
-        self.n_latent_critic = model_paras["n_latent_critic"]  # Hidden dimensions of the critic
         self.n_hidden_actor = model_paras["n_hidden_actor"]  # Number of layers in actor
-        self.n_hidden_critic = model_paras["n_hidden_critic"]  # Number of layers in critic
         self.action_dim = model_paras["action_dim"]  # Output dimension of actor
+        self.pop_size = model_paras["pop_size"]  # Population size for evolution
 
         # len() means of the number of HGNN iterations
         # and the element means the number of heads of each HGNN (=1 in final experiment)
@@ -141,8 +90,11 @@ class HGNNScheduler(nn.Module):
             self.get_operations.append(MLPs([self.out_size_ma, self.out_size_ope, self.out_size_ope, self.out_size_ope],
                                             self.hidden_size_ope, self.out_size_ope, self.num_heads[i], self.dropout))
 
-        self.actor = MLPActor(self.n_hidden_actor, self.actor_dim, self.n_latent_actor, self.action_dim).to(self.device)
-        self.critic = MLPCritic(self.n_hidden_critic, self.critic_dim, self.n_latent_critic, 1).to(self.device)
+        # self.population = []
+        # for _ in range(self.pop_size):
+        #     self.population.append(MLPIndiv(self.n_hidden_actor, self.actor_dim, self.n_latent_actor, self.action_dim).to(self.device))
+        
+        self.actor = actor
 
     def forward(self):
         '''
@@ -274,22 +226,9 @@ class HGNNScheduler(nn.Module):
         scores[~mask] = float('-inf')
         action_probs = F.softmax(scores, dim=1)
 
-        # Store data in memory during training
-        if flag_train == True:
-            memories.ope_ma_adj.append(copy.deepcopy(state.ope_ma_adj_batch))
-            memories.ope_pre_adj.append(copy.deepcopy(state.ope_pre_adj_batch))
-            memories.ope_sub_adj.append(copy.deepcopy(state.ope_sub_adj_batch))
-            memories.batch_idxes.append(copy.deepcopy(state.batch_idxes))
-            memories.raw_opes.append(copy.deepcopy(norm_opes))
-            memories.raw_mas.append(copy.deepcopy(norm_mas))
-            memories.proc_time.append(copy.deepcopy(norm_proc))
-            memories.nums_opes.append(copy.deepcopy(nums_opes))
-            memories.jobs_gather.append(copy.deepcopy(jobs_gather))
-            memories.eligible.append(copy.deepcopy(eligible))
-
         return action_probs, ope_step_batch, h_pooled
 
-    def act(self, state, memories, dones, flag_sample=True, flag_train=True):
+    def act(self, state, memories, dones, flag_sample=False, flag_train=True):
         # Get probability of actions and the id of the current operation (be waiting to be processed) of each job
         action_probs, ope_step_batch, _ = self.get_action_prob(state, memories, flag_sample, flag_train=flag_train)
 
@@ -305,12 +244,6 @@ class HGNNScheduler(nn.Module):
         mas = (action_indexes / state.mask_job_finish_batch.size(1)).long()
         jobs = (action_indexes % state.mask_job_finish_batch.size(1)).long()
         opes = ope_step_batch[state.batch_idxes, jobs]
-
-        # Store data in memory during training
-        if flag_train == True:
-            # memories.states.append(copy.deepcopy(state))
-            memories.logprobs.append(dist.log_prob(action_indexes))
-            memories.action_indexes.append(action_indexes)
 
         return torch.stack((opes, mas, jobs), dim=1).t()
 
@@ -345,48 +278,31 @@ class HGNNScheduler(nn.Module):
 
         scores[~mask] = float('-inf')
         action_probs = F.softmax(scores, dim=1)
-        state_values = self.critic(h_pooled)
         dist = Categorical(action_probs.squeeze())
         action_logprobs = dist.log_prob(action_envs)
         dist_entropys = dist.entropy()
-        return action_logprobs, state_values.squeeze().double(), dist_entropys
+        return action_logprobs, dist_entropys
 
-class PPO:
-    def __init__(self, model_paras, train_paras, num_envs=None):
+class ERL:
+    def __init__(self, model_paras, train_paras, actor, num_envs=None):
         self.lr = train_paras["lr"]  # learning rate
         self.betas = train_paras["betas"]  # default value for Adam
         self.gamma = train_paras["gamma"]  # discount factor
-        self.eps_clip = train_paras["eps_clip"]  # clip ratio for PPO
-        self.K_epochs = train_paras["K_epochs"]  # Update policy for K epochs
-        self.A_coeff = train_paras["A_coeff"]  # coefficient for policy loss
-        self.vf_coeff = train_paras["vf_coeff"]  # coefficient for value loss
-        self.entropy_coeff = train_paras["entropy_coeff"]  # coefficient for entropy term
         self.num_envs = num_envs  # Number of parallel instances
         self.device = model_paras["device"]  # PyTorch device
 
-        self.policy = HGNNScheduler(model_paras).to(self.device)
+        self.policy = ERLScheduler(model_paras, actor).to(self.device)
         self.policy_old = copy.deepcopy(self.policy)
         self.policy_old.load_state_dict(self.policy.state_dict())
         self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=self.lr, betas=self.betas)
         self.MseLoss = nn.MSELoss()
 
-    def update(self, memory, env_paras, train_paras):
+    def get_reward(self, memory, env_paras, train_paras):
         device = env_paras["device"]
-        minibatch_size = train_paras["minibatch_size"]  # batch size for updating
 
         # Flatten the data in memory (in the dim of parallel instances and decision points)
-        old_ope_ma_adj = torch.stack(memory.ope_ma_adj, dim=0).transpose(0,1).flatten(0,1)
-        old_ope_pre_adj = torch.stack(memory.ope_pre_adj, dim=0).transpose(0, 1).flatten(0, 1)
-        old_ope_sub_adj = torch.stack(memory.ope_sub_adj, dim=0).transpose(0, 1).flatten(0, 1)
-        old_raw_opes = torch.stack(memory.raw_opes, dim=0).transpose(0, 1).flatten(0, 1)
-        old_raw_mas = torch.stack(memory.raw_mas, dim=0).transpose(0, 1).flatten(0, 1)
-        old_proc_time = torch.stack(memory.proc_time, dim=0).transpose(0, 1).flatten(0, 1)
-        old_jobs_gather = torch.stack(memory.jobs_gather, dim=0).transpose(0, 1).flatten(0, 1)
-        old_eligible = torch.stack(memory.eligible, dim=0).transpose(0, 1).flatten(0, 1)
         memory_rewards = torch.stack(memory.rewards, dim=0).transpose(0,1)
         memory_is_terminals = torch.stack(memory.is_terminals, dim=0).transpose(0,1)
-        old_logprobs = torch.stack(memory.logprobs, dim=0).transpose(0,1).flatten(0,1)
-        old_action_envs = torch.stack(memory.action_indexes, dim=0).transpose(0,1).flatten(0, 1)
 
         # Estimate and normalize the rewards
         rewards_envs = []
@@ -404,46 +320,28 @@ class PPO:
             rewards = torch.tensor(rewards, dtype=torch.float64).to(device)
             rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-5)
             rewards_envs.append(rewards)
+        
         rewards_envs = torch.cat(rewards_envs)
+        ep_reward = discounted_rewards.item() / (self.num_envs * train_paras["update_timestep"])
 
-        loss_epochs = 0
-        full_batch_size = old_ope_ma_adj.size(0)
-        num_complete_minibatches = math.floor(full_batch_size / minibatch_size)
-        # Optimize policy for K epochs:
-        for _ in range(self.K_epochs):
-            for i in range(num_complete_minibatches+1):
-                if i < num_complete_minibatches:
-                    start_idx = i * minibatch_size
-                    end_idx = (i + 1) * minibatch_size
-                else:
-                    start_idx = i * minibatch_size
-                    end_idx = full_batch_size
-                logprobs, state_values, dist_entropy = \
-                    self.policy.evaluate(old_ope_ma_adj[start_idx: end_idx, :, :],
-                                         old_ope_pre_adj[start_idx: end_idx, :, :],
-                                         old_ope_sub_adj[start_idx: end_idx, :, :],
-                                         old_raw_opes[start_idx: end_idx, :, :],
-                                         old_raw_mas[start_idx: end_idx, :, :],
-                                         old_proc_time[start_idx: end_idx, :, :],
-                                         old_jobs_gather[start_idx: end_idx, :, :],
-                                         old_eligible[start_idx: end_idx, :, :],
-                                         old_action_envs[start_idx: end_idx])
+        return discounted_rewards, 0
 
-                ratios = torch.exp(logprobs - old_logprobs[i*minibatch_size:(i+1)*minibatch_size].detach())
-                advantages = rewards_envs[i*minibatch_size:(i+1)*minibatch_size] - state_values.detach()
-                surr1 = ratios * advantages
-                surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
-                loss = - self.A_coeff * torch.min(surr1, surr2)\
-                       + self.vf_coeff * self.MseLoss(state_values, rewards_envs[i*minibatch_size:(i+1)*minibatch_size])\
-                       - self.entropy_coeff * dist_entropy
-                loss_epochs += loss.mean().detach()
 
-                self.optimizer.zero_grad()
-                loss.mean().backward()
-                self.optimizer.step()
+        # # Store data in memory during training
+        # if flag_train == True:
+        #     memories.ope_ma_adj.append(copy.deepcopy(state.ope_ma_adj_batch))
+        #     memories.ope_pre_adj.append(copy.deepcopy(state.ope_pre_adj_batch))
+        #     memories.ope_sub_adj.append(copy.deepcopy(state.ope_sub_adj_batch))
+        #     memories.batch_idxes.append(copy.deepcopy(state.batch_idxes))
+        #     memories.raw_opes.append(copy.deepcopy(norm_opes))
+        #     memories.raw_mas.append(copy.deepcopy(norm_mas))
+        #     memories.proc_time.append(copy.deepcopy(norm_proc))
+        #     memories.nums_opes.append(copy.deepcopy(nums_opes))
+        #     memories.jobs_gather.append(copy.deepcopy(jobs_gather))
+        #     memories.eligible.append(copy.deepcopy(eligible))
 
-        # Copy new weights into old policy:
-        self.policy_old.load_state_dict(self.policy.state_dict())
-
-        return loss_epochs.item() / self.K_epochs, \
-               discounted_rewards.item() / (self.num_envs * train_paras["update_timestep"])
+        # # Store data in memory during training
+        # if flag_train == True:
+        #     # memories.states.append(copy.deepcopy(state))
+        #     memories.logprobs.append(dist.log_prob(action_indexes))
+        #     memories.action_indexes.append(action_indexes)

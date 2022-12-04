@@ -1,6 +1,7 @@
 import gym
 import env
 import PPO_model
+import ERL_model
 import torch
 import time
 import os
@@ -25,21 +26,24 @@ def validate(env_paras, env, model_policy):
     '''
     start = time.time()
     batch_size = env_paras["batch_size"]
-    memory = PPO_model.Memory()
+    memory = ERL_model.Memory()
     # print('There are {0} dev instances.'.format(batch_size))  # validation set is also called development set
     state = env.state
     done = False
     dones = env.done_batch
-    while ~done:
-        with torch.no_grad():
+
+    with torch.no_grad():
+        while ~done:
             actions = model_policy.act(state, memory, dones, flag_sample=False, flag_train=False)
-        state, rewards, dones = env.step(actions)
-        done = dones.all()
+            state, rewards, dones = env.step(actions)
+            done = dones.all()
+
     gantt_result = env.validate_gantt()[0]
     if not gantt_result:
         print("Scheduling Error！！！！！！")
+
     makespan = copy.deepcopy(env.makespan_batch.mean())
     makespan_batch = copy.deepcopy(env.makespan_batch)
     env.reset()
-    print("val_time: {:.3f}s\n".format(time.time()-start))
-    return makespan, makespan_batch
+    # print("val_time: {:.3f}s".format(time.time()-start))
+    return makespan

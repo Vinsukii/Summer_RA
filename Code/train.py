@@ -11,7 +11,9 @@ import torch
 import numpy as np
 from visdom import Visdom
 
-import PPO_model
+import ERL_model
+from mlp import MLPIndiv
+from neuroevolution import SSNE
 from env.case_generator import CaseGenerator
 from validate import validate, get_validate_env
 
@@ -63,117 +65,136 @@ def main():
 
     print("-",str(num_jobs)+str(num_mas).zfill(2),"-\n")
 
-    memories = PPO_model.Memory()
-    model = PPO_model.PPO(model_paras, train_paras, num_envs=env_paras["batch_size"])
     env_valid = get_validate_env(env_valid_paras)  # Create an environment for validation
     maxlen = 1  # Save the best model
     best_models = deque()
     makespan_best = float('inf')
 
-    # Use visdom to visualize the training process
-    is_viz = train_paras["viz"]
-    if is_viz:
-        viz = Visdom(env=train_paras["viz_name"])
 
     # Generate data files and fill in the header
     str_time = time.strftime("%Y%m%d_%H%M%S", time.localtime(time.time()))
     save_path = './save/train_{0}'.format(str_time[:-2])
     os.makedirs(save_path)
 
-    valid_results = []
-    valid_results_100 = []
+
+    pop_size = model_paras["pop_size"]
+    n_hidden_actor = model_paras["n_hidden_actor"]
+    actor_dim = model_paras["actor_in_dim"]
+    n_latent_actor = model_paras["n_latent_actor"]
+    action_dim = model_paras["action_dim"]
+
+
+    # Popopulation-based
+    evolver = SSNE(pop_size)
+    gen_no = model_paras["gen_no"]  # Generation number
+    elite_fraction = model_paras["elite_frac"] # Fraction of elite individuals
+    crossover_prob = model_paras["cx_rate"] # Crossover rate
+    mutation_prob = model_paras["mt_rate"] # Mutation rate
 
 
     # Start training iteration
     start_time = time.time()
     env = None
-    for i in range(1, train_paras["max_iterations"]+1):
 
-        print("ITER_" + str(i))
+    pop = []
+    for __ in range(pop_size):
+        pop.append(MLPIndiv(n_hidden_actor, actor_dim, n_latent_actor, action_dim).to(device))
+    
+    result_makespans = []
+
+    for i in range(1, gen_no+1):
 
         # Replace training instances every x iteration (x = 20 in paper)
         if (i - 1) % train_paras["parallel_iter"] == 0:
-            # \mathcal{B} instances use consistent operations to speed up training
             nums_ope = [random.randint(opes_per_job_min, opes_per_job_max) for _ in range(num_jobs)]
             case = CaseGenerator(num_jobs, num_mas, opes_per_job_min, opes_per_job_max, nums_ope=nums_ope)
             env = gym.make('fjsp-v0', case=case, env_paras=env_paras)
-            print('num_job: ', num_jobs, '\tnum_mas: ', num_mas, '\tnum_opes: ', sum(nums_ope))
+            print('\nnum_job: ', num_jobs, '\tnum_mas: ', num_mas, '\tnum_opes: ', sum(nums_ope))
 
-        # Get state and completion signal
-        state = env.state
-        done = False
-        dones = env.done_batch
+        print("\nGEN_" + str(i))
+        all_fitness = []
+        all_makespans = []
+        test_makespans = []
+
         last_time = time.time()
+        
+        for id in range(1, pop_size+1):
+            actor = pop[id-1]
+            memories = ERL_model.Memory()
+            model = ERL_model.ERL(model_paras, train_paras, actor, num_envs=env_paras["batch_size"])
 
-        # Schedule in parallel
-        while ~done:
+            # Get state and completion signal
+            state = env.state
+            done = False
+            dones = env.done_batch
+
+            # Schedule in parallel
+            fitness = 0
             with torch.no_grad():
-                actions = model.policy_old.act(state, memories, dones)
-            state, rewards, dones = env.step(actions)
-            done = dones.all()
-            memories.rewards.append(rewards)
-            memories.is_terminals.append(dones)
-            # gpu_tracker.track()  # Used to monitor memory (of gpu)
+                while ~done:
+                    actions = model.policy_old.act(state, memories, dones)
+                    state, rewards, dones = env.step(actions)
+                    fitness += rewards
+                    
+                    done = dones.all()
+                    memories.rewards.append(rewards)
+                    memories.is_terminals.append(dones)
+                    # gpu_tracker.track()  # Used to monitor memory (of gpu)
 
-        train_time = time.time()-last_time
+            # Scores
+            fitness = fitness.mean()
+            all_fitness.append(fitness.mean().item())
+            
+            makespan = env.makespan_batch.mean()
+            all_makespans.append(makespan.item())
 
-        # Verify the solution
-        gantt_result = env.validate_gantt()[0]
-        if not gantt_result:
-            print("Scheduling Error！！！！！！")
-        # print("Scheduling Finish")
+            # print("I_" + str(id) + " (fitness:", '%.3f' % fitness + "; makespan:", '%.3f' % makespan + ")")   
 
-        # env.render(mode='draw')
-        env.reset()
-
-        # if iter mod x = 0 then update the policy (x = 1 in paper)
-        if i % train_paras["update_timestep"] == 0:
-            loss, reward = model.update(memories, env_paras, train_paras)
-            print("reward: ", '%.3f' % reward, "; loss: ", '%.3f' % loss)
-            print("train_time: {:.3f}s".format(train_time))
+            # Asign fitness
+            actor.fitness = fitness
             memories.clear_memory()
-            if is_viz:
-                viz.line(X=np.array([i]), Y=np.array([reward]),
-                    win='window{}'.format(0), update='append', opts=dict(title='reward of envs'))
-                viz.line(X=np.array([i]), Y=np.array([loss]),
-                    win='window{}'.format(1), update='append', opts=dict(title='loss of envs'))  # deprecated
-
-        # if iter mod x = 0 then validate the policy (x = 10 in paper)
-        if i % train_paras["save_timestep"] == 0:
-            # print('\nStart validating')
+            env.reset()
+            
             # Record the average results and the results on each instance
-            vali_result, vali_result_100 = validate(env_valid_paras, env_valid, model.policy_old)
-            valid_results.append(vali_result.item())
-            valid_results_100.append(vali_result_100)
+            test_makespan = validate(env_valid_paras, env_valid, model.policy_old)
+            test_makespans.append(test_makespan.item())
 
             # Save the best model
-            if vali_result < makespan_best:
-                makespan_best = vali_result
+            if test_makespan < makespan_best:
+                makespan_best = test_makespan
                 if len(best_models) == maxlen:
                     delete_file = best_models.popleft()
                     os.remove(delete_file)
-                save_file = '{0}/save_best_{1}_{2}_{3}.pt'.format(save_path, num_jobs, num_mas, i)
+                save_file = '{0}/save_best_{1}_{2}_gen({3})_id({4}).pt'.format(save_path, num_jobs, num_mas, i, id)
                 best_models.append(save_file)
                 torch.save(model.policy.state_dict(), save_file)
+        
+        train_time = time.time()-last_time
+        print("train_time: {:.3f}s".format(train_time))
 
-            if is_viz:
-                viz.line(
-                    X=np.array([i]), Y=np.array([vali_result.item()]),
-                    win='window{}'.format(2), update='append', opts=dict(title='makespan of valid'))
+        print("")
+        print("Fitness    (Avg:", '%.3f' % np.mean(all_fitness), "| Max:", '%.3f' % np.max(all_fitness), "| Min:", '%.3f' % np.min(all_fitness) + ")")
+        print("Makespan   (Avg:", '%.3f' % np.mean(all_makespans), "| Max:", '%.3f' % np.max(all_makespans), "| Min:", '%.3f' % np.min(all_makespans) + ")")
+        print("Validation (Avg:", '%.3f' % np.mean(test_makespans), "| Max:", '%.3f' % np.max(test_makespans), "| Min:", '%.3f' % np.min(test_makespans) + ")")
+
+        # Save the best result
+        result_makespans.append(np.min(test_makespans))
+
+        # Evolution
+        evolver.epoch(i, pop, all_fitness)
+
 
     # Save the data of training curve to files
     ss = str(num_jobs)+"_"+str(num_mas)
 
-    data_100 = pd.DataFrame([np.arange(10, 1010, 10), np.array(torch.stack(valid_results_100, dim=0).to('cpu'))]).T
-    data_100.to_csv('{0}/training_100_{1}.csv'.format(save_path, ss),
-                    header=['Iter', 'Makespan'], index=False)
-
-    data_avg = pd.DataFrame([np.arange(10, 1010, 10), valid_results]).T
+    data_avg = pd.DataFrame([np.arange(1, gen_no+1, 1), result_makespans]).T
     data_avg.to_csv('{0}/training_avg_{1}.csv'.format(save_path, ss),
-                    header=['Iter', 'Avg Makespan'], index=False)
+                    header=['Iter', 'Min Makespan'], index=False)
 
-
-    print("total_time: {:.3f}s".format(time.time()-start_time))
+    print("\ntotal_time: {:.3f}s".format(time.time()-start_time))
 
 if __name__ == '__main__':
     main()
+
+
+
