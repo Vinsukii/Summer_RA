@@ -1,3 +1,4 @@
+import sys
 import copy
 import json
 import os
@@ -28,19 +29,24 @@ def setup_seed(seed):
     random.seed(seed)
     torch.backends.cudnn.deterministic = True
 
-def main():
+def main(seed=0, method="", algo=""):
     # PyTorch initialization
     # gpu_tracker = MemTracker()  # Used to monitor memory (of gpu)
 
+    #SEED
+    # setup_seed(seed)
+
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    
 
     if device.type == 'cuda':
         torch.cuda.set_device(device)
         torch.set_default_tensor_type('torch.cuda.FloatTensor')
-        print("\nPyTorch device:", device.type, "(" + str(torch.cuda.device_count()) + ")\n")
+        print("\nPyTorch device:", device.type, "(" + str(torch.cuda.device_count()) + ")")
     else:
         torch.set_default_tensor_type('torch.FloatTensor')
-        print("\nPyTorch device:", device.type, "(" + str(os.cpu_count()) + ")\n")
+        print("\nPyTorch device:", device.type, "(" + str(os.cpu_count()) + ")")
+    print("Train seed:", seed, "\n")
 
     torch.set_printoptions(precision=None, threshold=np.inf, edgeitems=None, linewidth=None, profile=None, sci_mode=False)
 
@@ -61,9 +67,9 @@ def main():
     num_mas = env_paras["num_mas"]
     opes_per_job_min = int(num_mas * 0.8)
     opes_per_job_max = int(num_mas * 1.2)
-    
+    envS = str(num_jobs)+str(num_mas).zfill(2)
 
-    print("-",str(num_jobs)+str(num_mas).zfill(2),"-\n")
+    print("-",envS,"-")
 
     env_valid = get_validate_env(env_valid_paras)  # Create an environment for validation
     maxlen = 1  # Save the best model
@@ -73,7 +79,7 @@ def main():
 
     # Generate data files and fill in the header
     str_time = time.strftime("%Y%m%d_%H%M%S", time.localtime(time.time()))
-    save_path = './save/train_{0}'.format(str_time[:-2])
+    save_path = './save/{0}/{1}/train_{2}_{3}'.format(method, envS, algo, str_time[:-2])
     os.makedirs(save_path)
 
 
@@ -85,11 +91,12 @@ def main():
 
 
     # Popopulation-based
-    evolver = SSNE(pop_size)
     gen_no = model_paras["gen_no"]  # Generation number
     elite_fraction = model_paras["elite_frac"] # Fraction of elite individuals
     crossover_prob = model_paras["cx_rate"] # Crossover rate
     mutation_prob = model_paras["mt_rate"] # Mutation rate
+
+    evolver = SSNE(pop_size, elite_fraction, crossover_prob, mutation_prob)
 
 
     # Start training iteration
@@ -194,7 +201,7 @@ def main():
     print("\ntotal_time: {:.3f}s".format(time.time()-start_time))
 
 if __name__ == '__main__':
-    main()
+    main(int(sys.argv[-3]), sys.argv[-2], sys.argv[-1])
 
 
 

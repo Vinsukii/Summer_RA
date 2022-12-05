@@ -1,3 +1,4 @@
+import sys
 import copy
 import json
 import os
@@ -24,21 +25,26 @@ def setup_seed(seed):
     random.seed(seed)
     torch.backends.cudnn.deterministic = True
 
-def main():
+def main(seed=0, method="", algo=""):
     # PyTorch initialization
     # gpu_tracker = MemTracker()  # Used to monitor memory (of gpu)
     # pynvml.nvmlInit()
     # handle = pynvml.nvmlDeviceGetHandleByIndex(0)
 
+    #SEED
+    # setup_seed(seed)
+
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    
 
     if device.type == 'cuda':
         torch.cuda.set_device(device)
         torch.set_default_tensor_type('torch.cuda.FloatTensor')
-        print("\nPyTorch device:", device.type, "(" + str(torch.cuda.device_count()) + ")\n")
+        print("\nPyTorch device:", device.type, "(" + str(torch.cuda.device_count()) + ")")
     else:
         torch.set_default_tensor_type('torch.FloatTensor')
-        print("\nPyTorch device:", device.type, "(" + str(os.cpu_count()) + ")\n")
+        print("\nPyTorch device:", device.type, "(" + str(os.cpu_count()) + ")")
+    print("Train seed:", seed, "\n")
 
     torch.set_printoptions(precision=None, threshold=np.inf, edgeitems=None, linewidth=None, profile=None, sci_mode=False)
 
@@ -60,9 +66,13 @@ def main():
     model_paras["actor_in_dim"] = model_paras["out_size_ma"] * 2 + model_paras["out_size_ope"] * 2
     model_paras["critic_in_dim"] = model_paras["out_size_ma"] + model_paras["out_size_ope"]
 
-    print("-",test_paras["data_path"],"-")
+    num_jobs = env_paras["num_jobs"]
+    num_mas = env_paras["num_mas"]
+    envS = str(num_jobs)+str(num_mas).zfill(2)
 
-    data_path = "./data_test/{0}/".format(test_paras["data_path"])
+    print("-",envS,"-")
+
+    data_path = "./data_test/{0}/".format(envS.zfill(2))
     test_files = os.listdir(data_path)
     test_files.sort(key=lambda x: x[:-4])
     test_files = test_files[:num_ins]
@@ -80,21 +90,21 @@ def main():
     envs = []  # Store multiple environments
 
     # Detect and add models to "rules"
-    if "DRL" in rules:
+    if "ERL" in rules:
         for root, ds, fs in os.walk('./model/'):
             for f in fs:
                 if f.endswith('.pt'):
                     rules.append(f)
     if len(rules) != 1:
-        if "DRL" in rules:
-            rules.remove("DRL")
+        if "ERL" in rules:
+            rules.remove("ERL")
 
     # Generate data files and fill in the header
     str_time = time.strftime("%Y%m%d_%H%M%S", time.localtime(time.time()))
     if test_paras["sample"]:
-        save_path = './save/test_{0}-S'.format(str_time[:-2])
+        save_path = './save/{0}/{1}/test_{2}_{3}-S'.format(method, envS, algo, str_time[:-2])
     else:
-        save_path = './save/test_{0}-G'.format(str_time[:-2])
+        save_path = './save/{0}/{1}/test_{2}_{3}-G'.format(method, envS, algo, str_time[:-2])
     os.makedirs(save_path)
 
 
@@ -204,4 +214,4 @@ def schedule(env, model, memories, flag_sample=False):
 
 
 if __name__ == '__main__':
-    main()
+    main(int(sys.argv[-3]), sys.argv[-2], sys.argv[-1])

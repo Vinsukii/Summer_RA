@@ -5,9 +5,12 @@ import utils.erl_utils as utils
 
 class SSNE:
 
-	def __init__(self, pop_size):
+	def __init__(self, pop_size, elite_frac, cx_prob, mt_prob):
 		self.gen = 0
 		self.population_size = pop_size
+		self.elite_fraction = elite_frac
+		self.crossover_prob = cx_prob
+		self.mutation_prob = mt_prob
 		# self.writer = args.writer
 
 		#RL TRACKERS
@@ -202,9 +205,9 @@ class SSNE:
 
 
 	def epoch(self, gen, pop, fitness_evals):
-		elite_fraction = 0.1
-		crossover_prob = 0.1
-		mutation_prob = 0.8
+		elite_fraction = self.elite_fraction
+		crossover_prob = self.crossover_prob
+		mutation_prob = self.mutation_prob
 
 		self.gen+= 1; num_elitists = int(elite_fraction * len(fitness_evals))
 		if num_elitists < 2: num_elitists = 2

@@ -9,7 +9,7 @@
     "valid_batch_size": 10
   },
   "model_paras": {
-    "gen_no": 50,
+    "gen_no": 1,
     "pop_size": 30,
     "elite_frac": 0.1,
     "mt_rate": 0.8,
@@ -45,12 +45,12 @@
     "parallel_iter": 10
   },
   "test_paras": {
-    "num_ins": 130,
-    "rules": ["DRL"],
-    "sample": true,
-    "num_sample": 130,
-    "num_average": 10,
+    "num_ins": 100,
+    "rules": ["ERL"],
+    "sample": false,
+    "num_sample": 10,
+    "num_average": 100,
     "public_ins": true,
-    "data_path": "Public"
+    "data_path": "1005"
   }
 }
