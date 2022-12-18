@@ -9,7 +9,7 @@
     "valid_batch_size": 10
   },
   "model_paras": {
-    "gen_no": 1,
+    "gen_no": 50,
     "pop_size": 30,
     "elite_frac": 0.1,
     "mt_rate": 0.8,
